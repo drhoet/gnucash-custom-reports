@@ -41,25 +41,57 @@
 (define optname-accounts (N_ "Accounts"))
 (define optname-price-source (N_ "Price Source"))
 
+(define (find-stock-base-currency commodity)
+  (let* ((pricedb (gnc-pricedb-get-db (gnc-get-current-book)))
+         (price-list (gnc-pricedb-lookup-latest-any-currency pricedb commodity)))
+    (if (eqv? price-list '())
+      #f
+      (let* ((price (car price-list))
+             (price-currency (gnc-price-get-currency price)))
+        (if (gnc-commodity-equiv commodity price-currency)
+          (gnc-price-get-commodity price)
+          price-currency
+        )
+      )
+    )
+  )
+)
+
+(define (convert-amount-to-currency value src-currency target-currency exchange-fn)
+  (let* ((src-currency-fraction (gnc-commodity-get-fraction src-currency))
+        (value-monetary (gnc:make-gnc-monetary src-currency (gnc-numeric-convert value src-currency-fraction GNC-RND-ROUND)))
+        (value-in-target-currency-monetary (exchange-fn value-monetary target-currency)))
+    (gnc:gnc-monetary-amount value-in-target-currency-monetary)
+  )
+)
+
 (define (analyze-currencies accounts report-currency report-date price-source)
-  (let ((tmp-map (make-hash-table 15)))
+  (let ((tmp-map (make-hash-table 15))
+        (exchange-fn (gnc:case-exchange-fn price-source report-currency report-date)))
     ;; collect per currency
     (for-each
       (lambda (acct)
         (let* ((commodity (xaccAccountGetCommodity acct))
-               (value (xaccAccountGetBalanceAsOfDate acct report-date))
-               (key (gnc-commodity-get-mnemonic commodity))
-               (sum (hash-get-handle tmp-map key)))
-          (if sum
-              (hash-set! tmp-map key (list commodity (+ (caddr sum) value)))
-              (hash-set! tmp-map key (list commodity value))
+               (value (xaccAccountGetBalanceAsOfDate acct report-date)))
+          (if (not (gnc-commodity-is-currency commodity))
+            ;; for stock, find the base currency and calculate the value in the currency
+            (let ((base-currency (find-stock-base-currency commodity)))
+              (set! value (convert-amount-to-currency value commodity base-currency exchange-fn))
+              (set! commodity base-currency)
+            )
+          )
+          (let* ((key (gnc-commodity-get-mnemonic commodity))
+                 (sum (hash-get-handle tmp-map key)))
+            (if sum
+                (hash-set! tmp-map key (list commodity (+ (caddr sum) value)))
+                (hash-set! tmp-map key (list commodity value))
+            )
           )
         )
       )
       accounts
     )
-    (let ((exchange-fn (gnc:case-exchange-fn price-source report-currency report-date))
-          (grand-total-collector (gnc:make-commodity-collector)))
+    (let ((grand-total-collector (gnc:make-commodity-collector)))
       ;; calculate grand total
       (hash-for-each
         (lambda (key lst)
