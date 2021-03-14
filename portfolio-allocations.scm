@@ -233,6 +233,36 @@
                   (report-currency-fraction (gnc-commodity-get-fraction report-currency))
                   (currency-data (analyze-currencies accounts report-currency report-date price-source))
                 )
+              (gnc:html-document-add-object! document
+                (let ((chart (gnc:make-html-chart)))
+                  ;; the minimum chartjs-based html-chart requires the following settings
+                  (gnc:html-chart-set-type! chart 'pie)
+
+                  ;; title is either a string, or a list of strings
+                  (gnc:html-chart-set-title! chart "Asset Currency Allocation")
+                  ; (gnc:html-chart-set-width! chart '(pixels . 480))
+                  (gnc:html-chart-set-height! chart '(pixels . 400))
+
+                  ;; data-labels and data-series should be the same length
+                  (gnc:html-chart-set-data-labels! chart
+                    (map
+                      (lambda (row) 
+                        (format #f "~A - ~A (~,2f%)"
+                          (gnc-commodity-get-mnemonic (car row))
+                          (gnc:monetary->string (caddr row))
+                           (* 100 (cadddr row)))
+                      )
+                      currency-data
+                    )
+                  )
+                  (gnc:html-chart-add-data-series! chart
+                                                  "Fraction"                                    ;series name
+                                                  (map cadddr currency-data)                    ;pie ratios
+                                                  (gnc:assign-colors (length currency-data)))   ;colours
+
+                  ;; piechart doesn't need axes display:
+                  (gnc:html-chart-set-axes-display! chart #f) chart)
+              )
               (gnc:html-table-set-col-headers! table (list (G_ "Name") (G_ "Actual Value") (G_ "Actual Value (EUR)") (G_ "Fraction")))
               (for-each
                 (lambda (row)
