@@ -33,6 +33,7 @@
 (use-modules (gnucash html))
 (use-modules (srfi srfi-1))
 (use-modules (ice-9 format))
+(use-modules (oop goops))
 
 (debug-enable 'backtrace)
 
@@ -40,6 +41,9 @@
 (define optname-report-date (N_ "Date"))
 (define optname-accounts (N_ "Accounts"))
 (define optname-price-source (N_ "Price Source"))
+
+(define pagename-categories (N_ "Report categories"))
+(define optname-category-currencies (N_ "Currencies"))
 
 (define (find-stock-base-currency commodity)
   (let* ((pricedb (gnc-pricedb-get-db (gnc-get-current-book)))
@@ -65,60 +69,180 @@
   )
 )
 
-(define (analyze-currencies accounts report-currency report-date price-source)
-  (let ((tmp-map (make-hash-table 15))
-        (exchange-fn (gnc:case-exchange-fn price-source report-currency report-date)))
-    ;; collect per currency
-    (for-each
-      (lambda (acct)
-        (let* ((commodity (xaccAccountGetCommodity acct))
-               (value (xaccAccountGetBalanceAsOfDate acct report-date)))
-          (if (not (gnc-commodity-is-currency commodity))
-            ;; for stock, find the base currency and calculate the value in the currency
-            (let ((base-currency (find-stock-base-currency commodity)))
-              (set! value (convert-amount-to-currency value commodity base-currency exchange-fn))
-              (set! commodity base-currency)
-            )
-          )
-          (let* ((key (gnc-commodity-get-mnemonic commodity))
-                 (sum (hash-get-handle tmp-map key)))
-            (if sum
-                (hash-set! tmp-map key (list commodity (+ (caddr sum) value)))
-                (hash-set! tmp-map key (list commodity value))
-            )
-          )
-        )
-      )
-      accounts
+(define (format-amount amount currency)
+  (let ((currency-fraction (gnc-commodity-get-fraction currency)))
+    (gnc:make-gnc-monetary currency (gnc-numeric-convert amount currency-fraction GNC-RND-ROUND))
+  )
+)
+
+(define (val-if pred val def)
+  (if (pred val)
+    val
+    def
+  )
+)
+
+(define (first lst)
+  (if lst
+    (if (> (length lst) 0)
+      (car lst)
+      #f
     )
-    (let ((grand-total-collector (gnc:make-commodity-collector)))
-      ;; calculate grand total
-      (hash-for-each
-        (lambda (key lst)
-          (let ((currency (car lst))
-                (sum (cadr lst)))
-            (grand-total-collector 'add currency sum)
-          )
+    #f
+  )
+)
+
+(define (find-line-with-prefix lines prefix)
+  (first
+    (filter
+      (lambda (line)
+        (if (>= (string-length line) (string-length prefix))
+          (string=? prefix (substring line 0 (string-length prefix)))
+          #f
         )
-        tmp-map
       )
-      ;; convert to table rows
-      (let* ((grand-total-monetary (gnc:sum-collector-commodity grand-total-collector report-currency exchange-fn))
-             (grand-total (gnc:gnc-monetary-amount grand-total-monetary)))
-        (hash-map->list
-          (lambda (key lst)
-            (let* ((currency (car lst))
-                  (currency-fraction (gnc-commodity-get-fraction currency))
-                  (sum (cadr lst))
-                  (sum-monetary (gnc:make-gnc-monetary currency (gnc-numeric-convert sum currency-fraction GNC-RND-ROUND)))
-                  (sum-in-report-currency-monetary (exchange-fn sum-monetary report-currency))
-                  (sum-in-report-currency (gnc:gnc-monetary-amount sum-in-report-currency-monetary)))
-              (list currency sum-monetary sum-in-report-currency-monetary (/ sum-in-report-currency grand-total))
+      lines
+    )
+  )
+)
+
+;; Parses the following structure:
+;; #CUR:EUR=0.6105;USD=0.2697;CHF=0.0316;GBP=0.0139
+;; #TYPE:STOCK=0.5139;BOND=0.4319;REALEST=0.0125;CASH=-0.0212;DERIV=0.0488;COMM=0.0151
+;; #REGIO:NA=0.4095;EU=0.3997;AS=0.1761
+;; #SECTOR:COMM=0.0544;CONSD=0.0941;CONSS=0.0941;ENER=0.0325;FINA=0.1201;HEAL=0.1179;INDU=0.1724;IT=0.2169;MAT=0.0325;REALEST=0.0325;UTIL=0.0325
+(define (parse-notes-for-fractions notes line-prefix splitter)
+  (let* ((lines (string-split notes #\newline))
+         (line (find-line-with-prefix lines line-prefix)))
+    (if line
+      ;; split by ';'. We then have "EUR=0.6105"
+      (let ((fractions (string-split (substring line (string-length line-prefix) (string-length line)) #\;)))
+        (val-if (lambda (x) (> (length x) 0)) ; filter out empty results
+          (map
+            ;; convert the last value to a factional number
+            (lambda (x)
+              (list (car x) (rationalize (inexact->exact (string->number (cadr x))) 1/10000))
+            )
+            (filter (lambda (lst) (= 2 (length lst))) ; filter out invalid lines
+              (map
+                ;; split on '='. We now have ("EUR", "0.6105")
+                (lambda (fraction)
+                  (string-split fraction #\=)
+                )
+                fractions
+              )
             )
           )
-          tmp-map
+          #f
         )
       )
+      #f
+    )
+  )
+)
+
+(define (calculate-currency-distribution acct currency-categories)
+  (let ((tmp-map (make-hash-table 15))
+        (type (xaccAccountGetType acct))
+        (acct-commodity (xaccAccountGetCommodity acct)))
+    (if (or (eq? type ACCT-TYPE-STOCK) (eq? type ACCT-TYPE-ASSET))
+      (let ((notes (xaccAccountGetNotes acct)))
+        (let ((fractions (parse-notes-for-fractions notes "#CUR:" ";")))
+          (if fractions
+            (for-each
+              (lambda (row)
+                (hash-set! tmp-map (car row) (cadr row))
+              )
+              fractions
+            )
+            (if (eq? type ACCT-TYPE-STOCK)
+              ; for stock, we find the base currency
+              (let ((base-currency (find-stock-base-currency acct-commodity)))
+                (if base-currency
+                  (hash-set! tmp-map (gnc-commodity-get-mnemonic base-currency) '1)
+                  (hash-set! tmp-map (gnc-commodity-get-mnemonic acct-commodity) '1)
+                )
+              )
+              ; otherwise, we take the account commodity
+              (hash-set! tmp-map (gnc-commodity-get-mnemonic acct-commodity) '1)
+            )
+          )
+        )
+      )
+      (hash-set! tmp-map (gnc-commodity-get-mnemonic acct-commodity) '1)
+    )
+    tmp-map
+  )
+)
+
+(define (analyze-currencies accounts report-currency report-date price-source exchange-fn currency-categories)
+  (let ((tmp-map             (make-hash-table 15)))
+    (filter identity ; filters out the #f elements
+      (map
+        (lambda (acct)
+          (let ((balance (xaccAccountGetBalanceAsOfDate acct report-date))
+                (acct-commodity (xaccAccountGetCommodity acct)))
+            (if (= balance 0)
+              #f ; we filter them out later
+              (let ((distr (calculate-currency-distribution acct currency-categories))
+                    (balance-in-report-currency (convert-amount-to-currency balance acct-commodity report-currency exchange-fn))
+                    (fractioned-amount 0))
+                (append
+                  (list (gnc-account-get-full-name acct) (format-amount balance acct-commodity))
+                  (map
+                    (lambda (currency)
+                      (let* ((fraction (hash-create-handle! distr currency 0))
+                             (amount-in-fraction (* balance-in-report-currency (cdr fraction))))
+                        (set! fractioned-amount (+ fractioned-amount amount-in-fraction))
+                        (format-amount amount-in-fraction report-currency)
+                      )
+                    )
+                    currency-categories
+                  )
+                  (list (format-amount (- balance-in-report-currency fractioned-amount) report-currency))
+                )
+              )
+            )
+          )
+        )
+        accounts
+      )
+    )
+  )
+)
+
+(define (calculate-totals table startcol colcount report-currency exchange-fn)
+  (let* ((collectors (make-list colcount 0))
+         (collectors (map (lambda (t) (gnc:make-commodity-collector)) collectors)))
+    (for-each
+      (lambda (row)
+        (map
+          (lambda (amount collector)
+            (collector 'add (gnc:gnc-monetary-commodity amount) (gnc:gnc-monetary-amount amount))
+            #f ; return something. We don't really want to map here....
+          )
+          (take (drop row startcol) colcount)
+          collectors
+        )
+      )
+      table
+    )
+    (map
+      (lambda (collector)
+        (gnc:sum-collector-commodity collector report-currency exchange-fn)
+      )
+      collectors
+    )
+  )
+)
+
+(define (calculate-percentages grand-total totals)
+  (let ((grand-total-val (gnc:gnc-monetary-amount grand-total)))
+    (map
+      (lambda (t)
+        (/ (gnc:gnc-monetary-amount t) grand-total-val)
+      )
+      totals
     )
   )
 )
@@ -158,6 +282,8 @@
           )
         )
       )
+      ;; Currencies to group by
+      (add-option (gnc:make-string-option pagename-categories optname-category-currencies "c" (N_ "A semicolon-separated list of currencies to group by.") (N_ "EUR;USD;CHF")))
 
     ;; Account tab
 
@@ -202,10 +328,11 @@
   ;; The first thing we do is make local variables for all the specific
   ;; options in the set of options given to the function. This set will
   ;; be generated by the options generator above.
-  (let ((accounts        (get-option gnc:pagename-accounts optname-accounts))
-        (report-currency (get-option gnc:pagename-general optname-report-currency))
-        (report-date     (gnc:time64-end-day-time (gnc:date-option-absolute-time (get-option gnc:pagename-general optname-report-date))))
-        (price-source    (get-option gnc:pagename-general optname-price-source))
+  (let ((accounts            (get-option gnc:pagename-accounts optname-accounts))
+        (report-currency     (get-option gnc:pagename-general optname-report-currency))
+        (report-date         (gnc:time64-end-day-time (gnc:date-option-absolute-time (get-option gnc:pagename-general optname-report-date))))
+        (price-source        (get-option gnc:pagename-general optname-price-source))
+        (currency-categories (string-split (get-option pagename-categories optname-category-currencies) #\;))
                 
         ;; document will be the HTML document that we return.
         (document (gnc:make-html-document)))
@@ -213,7 +340,8 @@
     ;; these are samples of different date options. for a simple
     ;; date with day, month, and year but no time you should use
     ;; qof-print-date
-    (let ((time-string (gnc-print-time64 report-date "%c")))
+    (let ((time-string (gnc-print-time64 report-date "%c"))
+          (exchange-fn         (gnc:case-exchange-fn price-source report-currency report-date)))
 
       (gnc:html-document-set-title! document (G_ "Portfolio Allocations"))
 
@@ -229,10 +357,11 @@
 
       (if (not (null? accounts))
           (begin
-            (let ((table (gnc:make-html-table))
-                  (report-currency-fraction (gnc-commodity-get-fraction report-currency))
-                  (currency-data (analyze-currencies accounts report-currency report-date price-source))
-                )
+            (let* ((table                    (gnc:make-html-table))
+                   (report-currency-fraction (gnc-commodity-get-fraction report-currency))
+                   (currency-data            (analyze-currencies accounts report-currency report-date price-source exchange-fn currency-categories))
+                   (totals                   (calculate-totals currency-data 1 (+ 2 (length currency-categories)) report-currency exchange-fn))
+                   (percentages              (calculate-percentages (car totals) (cdr totals))))
               (gnc:html-document-add-object! document
                 (let ((chart (gnc:make-html-chart)))
                   ;; the minimum chartjs-based html-chart requires the following settings
@@ -246,45 +375,56 @@
                   ;; data-labels and data-series should be the same length
                   (gnc:html-chart-set-data-labels! chart
                     (map
-                      (lambda (row) 
+                      (lambda (category value percentage) 
                         (format #f "~A - ~A (~,2f%)"
-                          (gnc-commodity-get-mnemonic (car row))
-                          (gnc:monetary->string (caddr row))
-                           (* 100 (cadddr row)))
+                          category
+                          (gnc:monetary->string value)
+                          (* 100 percentage)
+                        )
                       )
-                      currency-data
+                      (append currency-categories (list "Other"))
+                      (cdr totals)
+                      percentages
                     )
                   )
                   (gnc:html-chart-add-data-series! chart
                                                   "Fraction"                                    ;series name
-                                                  (map cadddr currency-data)                    ;pie ratios
+                                                  percentages                                   ;pie ratios
                                                   (gnc:assign-colors (length currency-data)))   ;colours
 
                   ;; piechart doesn't need axes display:
                   (gnc:html-chart-set-axes-display! chart #f) chart)
               )
-              (gnc:html-table-set-col-headers! table (list (G_ "Name") (G_ "Actual Value") (G_ "Actual Value (EUR)") (G_ "Fraction")))
+              (gnc:html-table-set-col-headers! table (append (list (G_ "Name") (G_ "Value")) currency-categories (list (G_ "Other"))))
               (for-each
                 (lambda (row)
-                  (let* ((currency (car row))
-                         (sum (cadr row))
-                         (sum-report-currency (caddr row))
-                         (fraction (cadddr row)))
+                  (let* ((name (car row))
+                         (value (cadr row))
+                         (fractions (cddr row)))
                     (gnc:html-table-append-row!
                       table
                       (map
                         gnc:make-html-table-cell/markup
-                        (list "text-cell" "number-cell" "number-cell" "number-cell")
-                        (list (gnc-commodity-get-mnemonic currency)
-                              sum
-                              sum-report-currency
-                              (format #f "~,2f%" (* 100 fraction))
-                        )
+                        (append (list "text-cell" "number-cell") (make-list (length currency-categories) "number-cell") (list "number-cell"))
+                        (append (list name value) fractions)
                       )
                     )
                   )
                 )
-                currency-data)
+                currency-data
+              )
+              (gnc:html-table-append-row/markup! table "grand-total" (list (gnc:make-html-table-cell/size 1 (+ 3 (length currency-categories)) (gnc:make-html-text (gnc:html-markup-hr)))))
+              (gnc:html-table-append-row/markup! table "grand-total"
+                (append
+                  (list (gnc:make-html-table-cell/markup "total-label-cell" "Total"))
+                  (map
+                    (lambda (sum)
+                      (gnc:make-html-table-cell/markup "total-number-cell" sum)
+                    )
+                    totals
+                  )
+                )
+              )
               (gnc:html-document-add-object! document table)
             )
           )
