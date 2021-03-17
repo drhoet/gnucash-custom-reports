@@ -141,7 +141,7 @@
   )
 )
 
-(define (calculate-currency-distribution acct currency-categories)
+(define (calculate-currency-distribution acct)
   (let ((tmp-map (make-hash-table 15))
         (type (xaccAccountGetType acct))
         (acct-commodity (xaccAccountGetCommodity acct)))
@@ -175,7 +175,43 @@
   )
 )
 
-(define (analyze-currencies accounts report-currency report-date price-source exchange-fn currency-categories)
+(define (calculate-asset-distribution acct)
+  (let ((tmp-map (make-hash-table 15))
+        (type (xaccAccountGetType acct)))
+    (if (or (eq? type ACCT-TYPE-STOCK) (eq? type ACCT-TYPE-ASSET))
+      (let ((notes (xaccAccountGetNotes acct)))
+        (let ((fractions (parse-notes-for-fractions notes "#TYPE:" ";")))
+          (if fractions
+            (for-each
+              (lambda (row)
+                (hash-set! tmp-map (car row) (cadr row))
+              )
+              fractions
+            )
+            (if (eq? type ACCT-TYPE-STOCK)
+              (hash-set! tmp-map "STOCK" '1) ; assume all STOCK for stocks.
+              #f
+            )
+          )
+        )
+      )
+      (if (eq? type ACCT-TYPE-BANK)
+        (hash-set! tmp-map "CASH" '1)
+        #f
+      )
+    )
+    tmp-map
+  )
+)
+
+;; Analyzes a set of accounts in categories
+;; accounts         - the accounts to analyze
+;; categories       - a list of the categories into which to categorize 
+;; distribution-fn  - the function that will be used to categorize the money in the accounts
+;; report-currency  - the currency to print the report in
+;; report-date      - the date for which the report is generated
+;; exchange-fn      - the exchange function to be used when converting currencies
+(define (analyze-categories accounts categories distribution-fn report-currency report-date exchange-fn)
   (let ((tmp-map             (make-hash-table 15)))
     (filter identity ; filters out the #f elements
       (map
@@ -184,20 +220,20 @@
                 (acct-commodity (xaccAccountGetCommodity acct)))
             (if (= balance 0)
               #f ; we filter them out later
-              (let ((distr (calculate-currency-distribution acct currency-categories))
+              (let ((distr (distribution-fn acct))
                     (balance-in-report-currency (convert-amount-to-currency balance acct-commodity report-currency exchange-fn))
                     (fractioned-amount 0))
                 (append
                   (list (gnc-account-get-full-name acct) (format-amount balance acct-commodity))
                   (map
-                    (lambda (currency)
-                      (let* ((fraction (hash-create-handle! distr currency 0))
+                    (lambda (category)
+                      (let* ((fraction (hash-create-handle! distr category 0))
                              (amount-in-fraction (* balance-in-report-currency (cdr fraction))))
                         (set! fractioned-amount (+ fractioned-amount amount-in-fraction))
                         (format-amount amount-in-fraction report-currency)
                       )
                     )
-                    currency-categories
+                    categories
                   )
                   (list (format-amount (- balance-in-report-currency fractioned-amount) report-currency))
                 )
@@ -208,6 +244,25 @@
         accounts
       )
     )
+  )
+)
+
+(define (analyze-assets accounts asset-categories report-currency report-date exchange-fn)
+  (analyze-categories accounts asset-categories calculate-asset-distribution report-currency report-date exchange-fn)
+)
+
+(define (analyze-currencies accounts currency-categories report-currency report-date exchange-fn)
+  (analyze-categories accounts currency-categories calculate-currency-distribution report-currency report-date exchange-fn)
+)
+
+(define (asset-category-to-name cat)
+  (cond ((string=? "STOCK" cat) (G_ "Stock"))
+        ((string=? "BOND" cat) (G_ "Bonds"))
+        ((string=? "DERIV" cat) (G_ "Derivatives"))
+        ((string=? "CASH" cat) (G_ "Cash"))
+        ((string=? "COMM" cat) (G_ "Commodities"))
+        ((string=? "REALEST" cat) (G_ "Real Estate"))
+        (else (G_ "Unknown Category!!!"))
   )
 )
 
@@ -244,6 +299,111 @@
       )
       totals
     )
+  )
+)
+
+(define (order-by-percentage titles values percentages)
+  (sort
+    (map
+      (lambda (title value percentage)
+        (list title value percentage)
+      )
+      titles
+      values
+      percentages
+    )
+    (lambda (r1 r2)
+      (> (caddr r1) (caddr r2))
+    )
+  )
+)
+
+;; Renders a set of allocation data as a pie-chart + a table.
+;; document         - the document to render to
+;; accounts         - the list of accounts to render
+;; title            - the title of the pie chart
+;; categories       - a list of the categories. These will be used in the headers of the table. Must match the 'n' of category-data below.
+;; category-data    - the main data to be displayed. Must be a table, with one row per account. Each row must have the following fields:
+;;                    ( account name, account value in account commodity, value-cat-1, value-cat-2 ... value-cat-n, value in 'other' category)
+;; report-currency  - the currency to print the report in
+;; report-date      - the date for which the report is generated
+;; exchange-fn      - the exchange function to be used when converting currencies
+;; cat-display-fn   - a function to create a display name from the category keys from the 'categories' variable
+(define (render-category-allocation document accounts title categories category-data report-currency report-date exchange-fn cat-display-fn)
+  (let* ((table                    (gnc:make-html-table))
+         (report-currency-fraction (gnc-commodity-get-fraction report-currency))
+         (totals                   (calculate-totals category-data 1 (+ 2 (length categories)) report-currency exchange-fn))
+         (percentages              (calculate-percentages (car totals) (cdr totals))))
+    (gnc:html-document-add-object! document
+      (let ((chart (gnc:make-html-chart)))
+        ;; the minimum chartjs-based html-chart requires the following settings
+        (gnc:html-chart-set-type! chart 'pie)
+
+        ;; title is either a string, or a list of strings
+        (gnc:html-chart-set-title! chart title)
+        ; (gnc:html-chart-set-width! chart '(pixels . 480))
+        (gnc:html-chart-set-height! chart '(pixels . 400))
+
+        ;; data-labels and data-series should be the same length
+        (gnc:html-chart-set-data-labels! chart
+          (map
+            (lambda (item) 
+              (let ((category (car item))
+                    (value (cadr item))
+                    (percentage (caddr item)))
+                (format #f "~A - ~A (~,2f%)"
+                  category
+                  (gnc:monetary->string value)
+                  (* 100 percentage)
+                )
+              )
+            )
+            (order-by-percentage 
+              (append (map cat-display-fn categories) (list "Other"))
+              (cdr totals)
+              percentages
+            )
+          )
+        )
+        (gnc:html-chart-add-data-series! chart
+                                        "Fraction"                                    ;series name
+                                        percentages                                   ;pie ratios
+                                        (gnc:assign-colors (length category-data)))   ;colours
+
+        ;; piechart doesn't need axes display:
+        (gnc:html-chart-set-axes-display! chart #f) chart)
+    )
+    (gnc:html-table-set-col-headers! table (append (list (G_ "Name") (G_ "Value")) (map cat-display-fn categories) (list (G_ "Other"))))
+    (for-each
+      (lambda (row)
+        (let* ((name (car row))
+                (value (cadr row))
+                (fractions (cddr row)))
+          (gnc:html-table-append-row!
+            table
+            (map
+              gnc:make-html-table-cell/markup
+              (append (list "text-cell" "number-cell") (make-list (length categories) "number-cell") (list "number-cell"))
+              (append (list name value) fractions)
+            )
+          )
+        )
+      )
+      category-data
+    )
+    (gnc:html-table-append-row/markup! table "grand-total" (list (gnc:make-html-table-cell/size 1 (+ 3 (length categories)) (gnc:make-html-text (gnc:html-markup-hr)))))
+    (gnc:html-table-append-row/markup! table "grand-total"
+      (append
+        (list (gnc:make-html-table-cell/markup "total-label-cell" "Total"))
+        (map
+          (lambda (sum)
+            (gnc:make-html-table-cell/markup "total-number-cell" sum)
+          )
+          totals
+        )
+      )
+    )
+    (gnc:html-document-add-object! document table)
   )
 )
 
@@ -332,10 +492,9 @@
         (report-currency     (get-option gnc:pagename-general optname-report-currency))
         (report-date         (gnc:time64-end-day-time (gnc:date-option-absolute-time (get-option gnc:pagename-general optname-report-date))))
         (price-source        (get-option gnc:pagename-general optname-price-source))
+        (asset-categories    (list "STOCK" "BOND" "DERIV" "CASH" "COMM" "REALEST"))
         (currency-categories (string-split (get-option pagename-categories optname-category-currencies) #\;))
-                
-        ;; document will be the HTML document that we return.
-        (document (gnc:make-html-document)))
+        (document            (gnc:make-html-document)))
 
     ;; these are samples of different date options. for a simple
     ;; date with day, month, and year but no time you should use
@@ -356,84 +515,23 @@
             ))
 
       (if (not (null? accounts))
-          (begin
-            (let* ((table                    (gnc:make-html-table))
-                   (report-currency-fraction (gnc-commodity-get-fraction report-currency))
-                   (currency-data            (analyze-currencies accounts report-currency report-date price-source exchange-fn currency-categories))
-                   (totals                   (calculate-totals currency-data 1 (+ 2 (length currency-categories)) report-currency exchange-fn))
-                   (percentages              (calculate-percentages (car totals) (cdr totals))))
-              (gnc:html-document-add-object! document
-                (let ((chart (gnc:make-html-chart)))
-                  ;; the minimum chartjs-based html-chart requires the following settings
-                  (gnc:html-chart-set-type! chart 'pie)
-
-                  ;; title is either a string, or a list of strings
-                  (gnc:html-chart-set-title! chart "Asset Currency Allocation")
-                  ; (gnc:html-chart-set-width! chart '(pixels . 480))
-                  (gnc:html-chart-set-height! chart '(pixels . 400))
-
-                  ;; data-labels and data-series should be the same length
-                  (gnc:html-chart-set-data-labels! chart
-                    (map
-                      (lambda (category value percentage) 
-                        (format #f "~A - ~A (~,2f%)"
-                          category
-                          (gnc:monetary->string value)
-                          (* 100 percentage)
-                        )
-                      )
-                      (append currency-categories (list "Other"))
-                      (cdr totals)
-                      percentages
-                    )
-                  )
-                  (gnc:html-chart-add-data-series! chart
-                                                  "Fraction"                                    ;series name
-                                                  percentages                                   ;pie ratios
-                                                  (gnc:assign-colors (length currency-data)))   ;colours
-
-                  ;; piechart doesn't need axes display:
-                  (gnc:html-chart-set-axes-display! chart #f) chart)
-              )
-              (gnc:html-table-set-col-headers! table (append (list (G_ "Name") (G_ "Value")) currency-categories (list (G_ "Other"))))
-              (for-each
-                (lambda (row)
-                  (let* ((name (car row))
-                         (value (cadr row))
-                         (fractions (cddr row)))
-                    (gnc:html-table-append-row!
-                      table
-                      (map
-                        gnc:make-html-table-cell/markup
-                        (append (list "text-cell" "number-cell") (make-list (length currency-categories) "number-cell") (list "number-cell"))
-                        (append (list name value) fractions)
-                      )
-                    )
-                  )
-                )
-                currency-data
-              )
-              (gnc:html-table-append-row/markup! table "grand-total" (list (gnc:make-html-table-cell/size 1 (+ 3 (length currency-categories)) (gnc:make-html-text (gnc:html-markup-hr)))))
-              (gnc:html-table-append-row/markup! table "grand-total"
-                (append
-                  (list (gnc:make-html-table-cell/markup "total-label-cell" "Total"))
-                  (map
-                    (lambda (sum)
-                      (gnc:make-html-table-cell/markup "total-number-cell" sum)
-                    )
-                    totals
-                  )
-                )
-              )
-              (gnc:html-document-add-object! document table)
-            )
+        (begin
+          (let ((asset-category-data    (analyze-assets     accounts asset-categories report-currency report-date exchange-fn))
+                (currency-category-data (analyze-currencies accounts currency-categories report-currency report-date exchange-fn)))
+            (render-category-allocation document accounts (G_ "Asset Types") asset-categories asset-category-data report-currency report-date exchange-fn asset-category-to-name)
+            (render-category-allocation document accounts (G_ "Currencies") currency-categories currency-category-data report-currency report-date exchange-fn identity)
           )
-          (gnc:html-document-add-object!
-           document
-           (gnc:make-html-text
-            (gnc:html-markup-p (G_ "You have selected no accounts.")))))
-      
-      document)))
+        )
+        (gnc:html-document-add-object!
+          document
+          (gnc:make-html-text
+          (gnc:html-markup-p (G_ "You have selected no accounts.")))
+        )
+      )
+      document
+    )
+  )
+)
 
 ;; Here we define the actual report with gnc:define-report
 (gnc:define-report
