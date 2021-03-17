@@ -44,6 +44,8 @@
 
 (define pagename-categories (N_ "Report categories"))
 (define optname-category-currencies (N_ "Currencies"))
+(define optname-category-regions (N_ "Regions"))
+(define optname-market-to-region-mapping (N_ "Market to Region mapping for Stock accounts"))
 
 (define (find-stock-base-currency commodity)
   (let* ((pricedb (gnc-pricedb-get-db (gnc-get-current-book)))
@@ -115,29 +117,49 @@
   (let* ((lines (string-split notes #\newline))
          (line (find-line-with-prefix lines line-prefix)))
     (if line
-      ;; split by ';'. We then have "EUR=0.6105"
-      (let ((fractions (string-split (substring line (string-length line-prefix) (string-length line)) #\;)))
-        (val-if (lambda (x) (> (length x) 0)) ; filter out empty results
-          (map
-            ;; convert the last value to a factional number
-            (lambda (x)
-              (list (car x) (rationalize (inexact->exact (string->number (cadr x))) 1/10000))
-            )
-            (filter (lambda (lst) (= 2 (length lst))) ; filter out invalid lines
-              (map
-                ;; split on '='. We now have ("EUR", "0.6105")
-                (lambda (fraction)
-                  (string-split fraction #\=)
-                )
-                fractions
-              )
-            )
+      (map
+        ;; convert the last value to a factional number
+        (lambda (x)
+          (list (car x) (rationalize (inexact->exact (string->number (cadr x))) 1/1000000))
+        )
+        (parse-txt-line-for-mappings (substring line (string-length line-prefix) (string-length line)))
+      )
+      #f
+    )
+  )
+)
+
+;; Parses the following structure:
+;; EUR=0.6105;USD=0.2697;CHF=0.0316;GBP=0.0139
+(define (parse-txt-line-for-mappings line)
+  ;; split by ';'. We then have "EUR=0.6105"
+  (let ((fractions (string-split line #\;)))
+    (val-if (lambda (x) (> (length x) 0)) ; filter out empty results
+      (filter (lambda (lst) (= 2 (length lst))) ; filter out invalid lines
+        (map
+          ;; split on '='. We now have ("EUR", "0.6105")
+          (lambda (fraction)
+            (string-split fraction #\=)
           )
-          #f
+          fractions
         )
       )
       #f
     )
+  )
+)
+
+;; Parses the following structure:
+;; NYSE=NA;AEX=EU;SIX=CH;LSE=EU
+(define (parse-market-to-region-map line)
+  (let ((result (make-hash-table 15)))
+    (for-each
+      (lambda (row)
+        (hash-set! result (car row) (cadr row))
+      )
+      (parse-txt-line-for-mappings line)
+    )
+    result
   )
 )
 
@@ -204,19 +226,49 @@
   )
 )
 
+(define (calculate-region-distribution acct market-to-region-map)
+  (let ((tmp-map (make-hash-table 15))
+        (type (xaccAccountGetType acct)))
+    (if (or (eq? type ACCT-TYPE-STOCK) (eq? type ACCT-TYPE-ASSET))
+      (let ((notes (xaccAccountGetNotes acct)))
+        (let ((fractions        (parse-notes-for-fractions notes "#REGION:" ";")))
+          (if fractions
+            (for-each
+              (lambda (row)
+                (hash-set! tmp-map (car row) (cadr row))
+              )
+              fractions
+            )
+            ; for STOCK, try to take the market from the commodity
+            (if (eq? type ACCT-TYPE-STOCK)
+              (let ((market (gnc-commodity-get-namespace (xaccAccountGetCommodity acct))))
+                (hash-set! tmp-map (cdr (hash-create-handle! market-to-region-map market #f)) '1)
+              )
+              #f
+            )
+          )
+        )
+      )
+      #f
+    )
+    tmp-map
+  )
+)
+
 ;; Analyzes a set of accounts in categories
-;; accounts         - the accounts to analyze
-;; categories       - a list of the categories into which to categorize 
-;; distribution-fn  - the function that will be used to categorize the money in the accounts
-;; report-currency  - the currency to print the report in
-;; report-date      - the date for which the report is generated
-;; exchange-fn      - the exchange function to be used when converting currencies
-(define (analyze-categories accounts categories distribution-fn report-currency report-date exchange-fn)
+;; accounts                     - the accounts to analyze
+;; accounts-relevant-fractions  - the relevant fraction of the amount of the account
+;; categories                   - a list of the categories into which to categorize 
+;; distribution-fn              - the function that will be used to categorize the money in the accounts
+;; report-currency              - the currency to print the report in
+;; report-date                  - the date for which the report is generated
+;; exchange-fn                  - the exchange function to be used when converting currencies
+(define (analyze-categories accounts accounts-relevant-fractions categories distribution-fn report-currency report-date exchange-fn)
   (let ((tmp-map             (make-hash-table 15)))
     (filter identity ; filters out the #f elements
       (map
-        (lambda (acct)
-          (let ((balance (xaccAccountGetBalanceAsOfDate acct report-date))
+        (lambda (acct acct-relev-frac)
+          (let ((balance (* acct-relev-frac (xaccAccountGetBalanceAsOfDate acct report-date)))
                 (acct-commodity (xaccAccountGetCommodity acct)))
             (if (= balance 0)
               #f ; we filter them out later
@@ -242,17 +294,55 @@
           )
         )
         accounts
+        accounts-relevant-fractions 
       )
     )
   )
 )
 
 (define (analyze-assets accounts asset-categories report-currency report-date exchange-fn)
-  (analyze-categories accounts asset-categories calculate-asset-distribution report-currency report-date exchange-fn)
+  (analyze-categories accounts (make-list (length accounts) 1) asset-categories calculate-asset-distribution report-currency report-date exchange-fn)
 )
 
 (define (analyze-currencies accounts currency-categories report-currency report-date exchange-fn)
-  (analyze-categories accounts currency-categories calculate-currency-distribution report-currency report-date exchange-fn)
+  (analyze-categories accounts (make-list (length accounts) 1) currency-categories calculate-currency-distribution report-currency report-date exchange-fn)
+)
+
+(define (analyze-regions accounts region-categories market-to-region-map report-currency report-date exchange-fn)
+  (let ((filtered-accounts
+          (filter
+            (lambda (acct)
+              (let ((type (xaccAccountGetType acct)))
+                (or (eq? type ACCT-TYPE-STOCK) (eq? type ACCT-TYPE-ASSET))
+              )
+            )
+            accounts
+          )
+        ))
+    (analyze-categories 
+      filtered-accounts
+      (map
+        (lambda (acct)
+          (let* ((type                    (xaccAccountGetType acct))
+                (asset-distr             (calculate-asset-distribution acct))
+                (stock-fraction-fallback (if (eq? type ACCT-TYPE-STOCK) '1 '0)))
+            (if asset-distr
+              (cdr (hash-create-handle! asset-distr "STOCK" stock-fraction-fallback))
+              stock-fraction-fallback
+            )
+          )
+        )
+        filtered-accounts
+      )
+      region-categories
+      (lambda (acct)
+        (calculate-region-distribution acct market-to-region-map)
+      )
+      report-currency
+      report-date
+      exchange-fn
+    )
+  )
 )
 
 (define (asset-category-to-name cat)
@@ -262,6 +352,16 @@
         ((string=? "CASH" cat) (G_ "Cash"))
         ((string=? "COMM" cat) (G_ "Commodities"))
         ((string=? "REALEST" cat) (G_ "Real Estate"))
+        (else (G_ "Unknown Category!!!"))
+  )
+)
+
+(define (region-category-to-name cat)
+  (cond ((string=? "NA" cat) (G_ "North America"))
+        ((string=? "LA" cat) (G_ "Latin America"))
+        ((string=? "EU" cat) (G_ "European Union"))
+        ((string=? "CH" cat) (G_ "Switzerland"))
+        ((string=? "AS" cat) (G_ "Asia"))
         (else (G_ "Unknown Category!!!"))
   )
 )
@@ -295,7 +395,12 @@
   (let ((grand-total-val (gnc:gnc-monetary-amount grand-total)))
     (map
       (lambda (t)
-        (/ (gnc:gnc-monetary-amount t) grand-total-val)
+        (let ((amt (gnc:gnc-monetary-amount t)))
+          (if (= amt 0)
+            0
+            (/ amt grand-total-val)
+          )
+        )
       )
       totals
     )
@@ -320,7 +425,6 @@
 
 ;; Renders a set of allocation data as a pie-chart + a table.
 ;; document         - the document to render to
-;; accounts         - the list of accounts to render
 ;; title            - the title of the pie chart
 ;; categories       - a list of the categories. These will be used in the headers of the table. Must match the 'n' of category-data below.
 ;; category-data    - the main data to be displayed. Must be a table, with one row per account. Each row must have the following fields:
@@ -329,7 +433,7 @@
 ;; report-date      - the date for which the report is generated
 ;; exchange-fn      - the exchange function to be used when converting currencies
 ;; cat-display-fn   - a function to create a display name from the category keys from the 'categories' variable
-(define (render-category-allocation document accounts title categories category-data report-currency report-date exchange-fn cat-display-fn)
+(define (render-category-allocation document title categories category-data report-currency report-date exchange-fn cat-display-fn)
   (let* ((table                    (gnc:make-html-table))
          (report-currency-fraction (gnc-commodity-get-fraction report-currency))
          (totals                   (calculate-totals category-data 1 (+ 2 (length categories)) report-currency exchange-fn))
@@ -345,31 +449,32 @@
         (gnc:html-chart-set-height! chart '(pixels . 400))
 
         ;; data-labels and data-series should be the same length
-        (gnc:html-chart-set-data-labels! chart
-          (map
-            (lambda (item) 
-              (let ((category (car item))
-                    (value (cadr item))
-                    (percentage (caddr item)))
-                (format #f "~A - ~A (~,2f%)"
-                  category
-                  (gnc:monetary->string value)
-                  (* 100 percentage)
+        (let ((ordered (order-by-percentage 
+                (append (map cat-display-fn categories) (list "Other"))
+                (cdr totals)
+                percentages
+              )))
+          (gnc:html-chart-set-data-labels! chart
+            (map
+              (lambda (item) 
+                (let ((category (car item))
+                      (value (cadr item))
+                      (percentage (caddr item)))
+                  (format #f "~A - ~A (~,2f%)"
+                    category
+                    (gnc:monetary->string value)
+                    (* 100 percentage)
+                  )
                 )
               )
-            )
-            (order-by-percentage 
-              (append (map cat-display-fn categories) (list "Other"))
-              (cdr totals)
-              percentages
+              ordered
             )
           )
+          (gnc:html-chart-add-data-series! chart
+                                          "Fraction"                                    ;series name
+                                          (map caddr ordered)                           ;pie ratios
+                                          (gnc:assign-colors (length category-data)))   ;colours
         )
-        (gnc:html-chart-add-data-series! chart
-                                        "Fraction"                                    ;series name
-                                        percentages                                   ;pie ratios
-                                        (gnc:assign-colors (length category-data)))   ;colours
-
         ;; piechart doesn't need axes display:
         (gnc:html-chart-set-axes-display! chart #f) chart)
     )
@@ -443,7 +548,10 @@
         )
       )
       ;; Currencies to group by
-      (add-option (gnc:make-string-option pagename-categories optname-category-currencies "c" (N_ "A semicolon-separated list of currencies to group by.") (N_ "EUR;USD;CHF")))
+      (add-option (gnc:make-string-option pagename-categories optname-category-currencies "c" (N_ "A semicolon-separated list of currencies to group by.") (N_ "EUR;USD;CHF;GBP")))
+      ;; Regions to group by
+      (add-option (gnc:make-string-option pagename-categories optname-category-regions "c" (N_ "A semicolon-separated list of regions to group by.") (N_ "NA;LA;EU;CH;AS")))
+      (add-option (gnc:make-string-option pagename-categories optname-market-to-region-mapping "c" (N_ "A semicolon-separated list of mappings from markets to regions.") (N_ "NYSE=NA;AIX=EU;NASDAQ=NA")))
 
     ;; Account tab
 
@@ -493,7 +601,9 @@
         (report-date         (gnc:time64-end-day-time (gnc:date-option-absolute-time (get-option gnc:pagename-general optname-report-date))))
         (price-source        (get-option gnc:pagename-general optname-price-source))
         (asset-categories    (list "STOCK" "BOND" "DERIV" "CASH" "COMM" "REALEST"))
+        (region-categories   (string-split (get-option pagename-categories optname-category-regions) #\;))
         (currency-categories (string-split (get-option pagename-categories optname-category-currencies) #\;))
+        (market-region-map   (parse-market-to-region-map (get-option pagename-categories optname-market-to-region-mapping)))
         (document            (gnc:make-html-document)))
 
     ;; these are samples of different date options. for a simple
@@ -517,9 +627,11 @@
       (if (not (null? accounts))
         (begin
           (let ((asset-category-data    (analyze-assets     accounts asset-categories report-currency report-date exchange-fn))
-                (currency-category-data (analyze-currencies accounts currency-categories report-currency report-date exchange-fn)))
-            (render-category-allocation document accounts (G_ "Asset Types") asset-categories asset-category-data report-currency report-date exchange-fn asset-category-to-name)
-            (render-category-allocation document accounts (G_ "Currencies") currency-categories currency-category-data report-currency report-date exchange-fn identity)
+                (currency-category-data (analyze-currencies accounts currency-categories report-currency report-date exchange-fn))
+                (region-category-data   (analyze-regions    accounts region-categories market-region-map report-currency report-date exchange-fn)))
+            (render-category-allocation document (G_ "Asset Types") asset-categories asset-category-data report-currency report-date exchange-fn asset-category-to-name)
+            (render-category-allocation document (G_ "Currencies") currency-categories currency-category-data report-currency report-date exchange-fn identity)
+            (render-category-allocation document (G_ "Regions (Stock)") region-categories region-category-data report-currency report-date exchange-fn region-category-to-name)
           )
         )
         (gnc:html-document-add-object!
