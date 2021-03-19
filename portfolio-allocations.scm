@@ -108,9 +108,20 @@
   )
 )
 
+(define (filter-accounts-by-type accounts types)
+  (filter
+    (lambda (acct)
+      (let ((type (xaccAccountGetType acct)))
+        (memq type types)
+      )
+    )
+    accounts
+  )
+)
+
 ;; Parses the following structure:
 ;; #CUR:EUR=0.6105;USD=0.2697;CHF=0.0316;GBP=0.0139
-;; #TYPE:STOCK=0.5139;BOND=0.4319;REALEST=0.0125;CASH=-0.0212;DERIV=0.0488;COMM=0.0151
+;; #TYPE:STOCK=0.5139;BOND=0.4319;REALESTATE=0.0125;CASH=-0.0212;DERIVATIVES=0.0488;COMMODITIES=0.0151
 ;; #REGIO:NA=0.4095;EU=0.3997;AS=0.1761
 ;; #SECTOR:COMM=0.0544;CONSD=0.0941;CONSS=0.0941;ENER=0.0325;FINA=0.1201;HEAL=0.1179;INDU=0.1724;IT=0.2169;MAT=0.0325;REALEST=0.0325;UTIL=0.0325
 (define (parse-notes-for-fractions notes line-prefix splitter)
@@ -227,27 +238,39 @@
 )
 
 (define (calculate-region-distribution acct market-to-region-map)
-  (let ((tmp-map (make-hash-table 15))
-        (type (xaccAccountGetType acct)))
-    (if (or (eq? type ACCT-TYPE-STOCK) (eq? type ACCT-TYPE-ASSET))
-      (let ((notes (xaccAccountGetNotes acct)))
-        (let ((fractions        (parse-notes-for-fractions notes "#REGION:" ";")))
-          (if fractions
-            (for-each
-              (lambda (row)
-                (hash-set! tmp-map (car row) (cadr row))
-              )
-              fractions
+  (let* ((tmp-map (make-hash-table 15))
+         (type (xaccAccountGetType acct))
+         (notes (xaccAccountGetNotes acct))
+         (fractions        (parse-notes-for-fractions notes "#REGION:" ";")))
+        (if fractions
+          (for-each
+            (lambda (row)
+              (hash-set! tmp-map (car row) (cadr row))
             )
-            ; for STOCK, try to take the market from the commodity
-            (if (eq? type ACCT-TYPE-STOCK)
-              (let ((market (gnc-commodity-get-namespace (xaccAccountGetCommodity acct))))
-                (hash-set! tmp-map (cdr (hash-create-handle! market-to-region-map market #f)) '1)
-              )
-              #f
+            fractions
+          )
+          ; for STOCK, try to take the market from the commodity
+          (if (eq? type ACCT-TYPE-STOCK)
+            (let ((market (gnc-commodity-get-namespace (xaccAccountGetCommodity acct))))
+              (hash-set! tmp-map (cdr (hash-create-handle! market-to-region-map market #f)) '1)
             )
+            #f
           )
         )
+    tmp-map
+  )
+)
+
+(define (calculate-market-distribution acct)
+  (let* ((tmp-map (make-hash-table 15))
+         (notes (xaccAccountGetNotes acct))
+         (fractions (parse-notes-for-fractions notes "#MARKET_TYPE:" ";")))
+    (if fractions
+      (for-each
+        (lambda (row)
+          (hash-set! tmp-map (car row) (cadr row))
+        )
+        fractions
       )
       #f
     )
@@ -308,50 +331,31 @@
   (analyze-categories accounts (make-list (length accounts) 1) currency-categories calculate-currency-distribution report-currency report-date exchange-fn)
 )
 
-(define (analyze-regions accounts region-categories market-to-region-map report-currency report-date exchange-fn)
-  (let ((filtered-accounts
-          (filter
-            (lambda (acct)
-              (let ((type (xaccAccountGetType acct)))
-                (or (eq? type ACCT-TYPE-STOCK) (eq? type ACCT-TYPE-ASSET))
-              )
-            )
-            accounts
-          )
-        ))
-    (analyze-categories 
-      filtered-accounts
-      (map
-        (lambda (acct)
-          (let* ((type                    (xaccAccountGetType acct))
-                (asset-distr             (calculate-asset-distribution acct))
-                (stock-fraction-fallback (if (eq? type ACCT-TYPE-STOCK) '1 '0)))
-            (if asset-distr
-              (cdr (hash-create-handle! asset-distr "STOCK" stock-fraction-fallback))
-              stock-fraction-fallback
-            )
-          )
-        )
-        filtered-accounts
-      )
-      region-categories
-      (lambda (acct)
-        (calculate-region-distribution acct market-to-region-map)
-      )
-      report-currency
-      report-date
-      exchange-fn
+(define (analyze-markets stock-accounts account-stock-fractions market-categories report-currency report-date exchange-fn)
+  (analyze-categories stock-accounts account-stock-fractions market-categories calculate-market-distribution report-currency report-date exchange-fn)
+)
+
+(define (analyze-regions stock-accounts account-stock-fractions region-categories market-to-region-map report-currency report-date exchange-fn)
+  (analyze-categories 
+    stock-accounts
+    account-stock-fractions
+    region-categories
+    (lambda (acct)
+      (calculate-region-distribution acct market-to-region-map)
     )
+    report-currency
+    report-date
+    exchange-fn
   )
 )
 
 (define (asset-category-to-name cat)
   (cond ((string=? "STOCK" cat) (G_ "Stock"))
         ((string=? "BOND" cat) (G_ "Bonds"))
-        ((string=? "DERIV" cat) (G_ "Derivatives"))
+        ((string=? "DERIVATIVES" cat) (G_ "Derivatives"))
         ((string=? "CASH" cat) (G_ "Cash"))
-        ((string=? "COMM" cat) (G_ "Commodities"))
-        ((string=? "REALEST" cat) (G_ "Real Estate"))
+        ((string=? "COMMODITIES" cat) (G_ "Commodities"))
+        ((string=? "REALESTATE" cat) (G_ "Real Estate"))
         (else (G_ "Unknown Category!!!"))
   )
 )
@@ -362,6 +366,13 @@
         ((string=? "EU" cat) (G_ "European Union"))
         ((string=? "CH" cat) (G_ "Switzerland"))
         ((string=? "AS" cat) (G_ "Asia"))
+        (else (G_ "Unknown Category!!!"))
+  )
+)
+
+(define (market-category-to-name cat)
+  (cond ((string=? "DEVELOPED" cat) (G_ "Developed Markets"))
+        ((string=? "EMERGING" cat) (G_ "Emerging Markets"))
         (else (G_ "Unknown Category!!!"))
   )
 )
@@ -476,7 +487,10 @@
                                           (gnc:assign-colors (length category-data)))   ;colours
         )
         ;; piechart doesn't need axes display:
-        (gnc:html-chart-set-axes-display! chart #f) chart)
+        (gnc:html-chart-set-axes-display! chart #f)
+
+        chart
+      )
     )
     (gnc:html-table-set-col-headers! table (append (list (G_ "Name") (G_ "Value")) (map cat-display-fn categories) (list (G_ "Other"))))
     (for-each
@@ -509,6 +523,23 @@
       )
     )
     (gnc:html-document-add-object! document table)
+  )
+)
+
+;; Calculates for all accounts how many of the value is in stocks. Accounts should only be STOCK or ASSET accounts!!
+(define (calculate-stock-fractions accounts)
+  (map
+    (lambda (acct)
+      (let* ((type                    (xaccAccountGetType acct))
+             (asset-distr             (calculate-asset-distribution acct))
+             (stock-fraction-fallback (if (eq? type ACCT-TYPE-STOCK) '1 '0)))
+        (if asset-distr
+          (cdr (hash-create-handle! asset-distr "STOCK" stock-fraction-fallback))
+          stock-fraction-fallback
+        )
+      )
+    )
+    accounts
   )
 )
 
@@ -600,10 +631,11 @@
         (report-currency     (get-option gnc:pagename-general optname-report-currency))
         (report-date         (gnc:time64-end-day-time (gnc:date-option-absolute-time (get-option gnc:pagename-general optname-report-date))))
         (price-source        (get-option gnc:pagename-general optname-price-source))
-        (asset-categories    (list "STOCK" "BOND" "DERIV" "CASH" "COMM" "REALEST"))
+        (asset-categories    (list "STOCK" "BOND" "DERIVATIVES" "CASH" "COMMODITIES" "REALESTATE"))
         (region-categories   (string-split (get-option pagename-categories optname-category-regions) #\;))
         (currency-categories (string-split (get-option pagename-categories optname-category-currencies) #\;))
         (market-region-map   (parse-market-to-region-map (get-option pagename-categories optname-market-to-region-mapping)))
+        (market-categories   (list "DEVELOPED" "EMERGING"))
         (document            (gnc:make-html-document)))
 
     ;; these are samples of different date options. for a simple
@@ -626,12 +658,16 @@
 
       (if (not (null? accounts))
         (begin
-          (let ((asset-category-data    (analyze-assets     accounts asset-categories report-currency report-date exchange-fn))
-                (currency-category-data (analyze-currencies accounts currency-categories report-currency report-date exchange-fn))
-                (region-category-data   (analyze-regions    accounts region-categories market-region-map report-currency report-date exchange-fn)))
+          (let* ((stock-accounts          (filter-accounts-by-type accounts (list ACCT-TYPE-STOCK ACCT-TYPE-ASSET)))
+                 (account-stock-fractions (calculate-stock-fractions stock-accounts))
+                 (asset-category-data     (analyze-assets     accounts asset-categories report-currency report-date exchange-fn))
+                 (currency-category-data  (analyze-currencies accounts currency-categories report-currency report-date exchange-fn))
+                 (region-category-data    (analyze-regions    stock-accounts account-stock-fractions region-categories market-region-map report-currency report-date exchange-fn))
+                 (market-category-data    (analyze-markets    stock-accounts account-stock-fractions market-categories report-currency report-date exchange-fn)))
             (render-category-allocation document (G_ "Asset Types") asset-categories asset-category-data report-currency report-date exchange-fn asset-category-to-name)
             (render-category-allocation document (G_ "Currencies") currency-categories currency-category-data report-currency report-date exchange-fn identity)
             (render-category-allocation document (G_ "Regions (Stock)") region-categories region-category-data report-currency report-date exchange-fn region-category-to-name)
+            (render-category-allocation document (G_ "Market Types (Stock)") market-categories market-category-data report-currency report-date exchange-fn market-category-to-name)
           )
         )
         (gnc:html-document-add-object!
