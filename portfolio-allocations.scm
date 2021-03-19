@@ -41,6 +41,7 @@
 (define optname-report-date (N_ "Date"))
 (define optname-accounts (N_ "Accounts"))
 (define optname-price-source (N_ "Price Source"))
+(define optname-show-tables (N_ "Show Tables"))
 
 (define pagename-categories (N_ "Report categories"))
 (define optname-category-currencies (N_ "Currencies"))
@@ -437,6 +438,7 @@
 ;; Renders a set of allocation data as a pie-chart + a table.
 ;; document         - the document to render to
 ;; title            - the title of the pie chart
+;; show-tables      - whether to show table or only pie chart
 ;; categories       - a list of the categories. These will be used in the headers of the table. Must match the 'n' of category-data below.
 ;; category-data    - the main data to be displayed. Must be a table, with one row per account. Each row must have the following fields:
 ;;                    ( account name, account value in account commodity, value-cat-1, value-cat-2 ... value-cat-n, value in 'other' category)
@@ -444,20 +446,22 @@
 ;; report-date      - the date for which the report is generated
 ;; exchange-fn      - the exchange function to be used when converting currencies
 ;; cat-display-fn   - a function to create a display name from the category keys from the 'categories' variable
-(define (render-category-allocation document title categories category-data report-currency report-date exchange-fn cat-display-fn)
+(define (render-category-allocation document title show-tables categories category-data report-currency report-date exchange-fn cat-display-fn)
   (let* ((table                    (gnc:make-html-table))
          (report-currency-fraction (gnc-commodity-get-fraction report-currency))
          (totals                   (calculate-totals category-data 1 (+ 2 (length categories)) report-currency exchange-fn))
          (percentages              (calculate-percentages (car totals) (cdr totals))))
+    (gnc:html-document-add-object! document (gnc:make-html-text "<div class=\"graph\">"))
     (gnc:html-document-add-object! document
       (let ((chart (gnc:make-html-chart)))
-        ;; the minimum chartjs-based html-chart requires the following settings
-        (gnc:html-chart-set-type! chart 'pie)
+        (gnc:html-chart-set-type! chart 'doughnut)
 
         ;; title is either a string, or a list of strings
         (gnc:html-chart-set-title! chart title)
-        ; (gnc:html-chart-set-width! chart '(pixels . 480))
+        (gnc:html-chart-set-width! chart '(percent . 100))
         (gnc:html-chart-set-height! chart '(pixels . 400))
+        (gnc:html-chart-set! chart '(options chartArea backgroundColor) "white")
+        ; (gnc:html-chart-set! chart '(options animation duration) 500)
 
         ;; data-labels and data-series should be the same length
         (let ((ordered (order-by-percentage 
@@ -488,41 +492,52 @@
         )
         ;; piechart doesn't need axes display:
         (gnc:html-chart-set-axes-display! chart #f)
-
+        ; the html-chart library actually defines a second axis for both x and y, which seems to be used as a border only. The function
+        ; html-chart-set-axes-display! does NOT hide that one, resulting in a weird top and right border. Below, we hack those static
+        ; axis out...
+        (gnc:html-chart-set! chart '(options scales xAxes) (vector (vector-ref (gnc:html-chart-get chart '(options scales xAxes)) 0)))
+        (gnc:html-chart-set! chart '(options scales yAxes) (vector (vector-ref (gnc:html-chart-get chart '(options scales yAxes)) 0)))
         chart
       )
     )
-    (gnc:html-table-set-col-headers! table (append (list (G_ "Name") (G_ "Value")) (map cat-display-fn categories) (list (G_ "Other"))))
-    (for-each
-      (lambda (row)
-        (let* ((name (car row))
-                (value (cadr row))
-                (fractions (cddr row)))
-          (gnc:html-table-append-row!
-            table
+    (gnc:html-document-add-object! document (gnc:make-html-text "</div>"))
+    (if show-tables
+      (begin
+        (gnc:html-table-set-col-headers! table (append (list (G_ "Name") (G_ "Value")) (map cat-display-fn categories) (list (G_ "Other"))))
+        (for-each
+          (lambda (row)
+            (let* ((name (car row))
+                    (value (cadr row))
+                    (fractions (cddr row)))
+              (gnc:html-table-append-row!
+                table
+                (map
+                  gnc:make-html-table-cell/markup
+                  (append (list "text-cell" "number-cell") (make-list (length categories) "number-cell") (list "number-cell"))
+                  (append (list name value) fractions)
+                )
+              )
+            )
+          )
+          category-data
+        )
+        (gnc:html-table-append-row/markup! table "grand-total" (list (gnc:make-html-table-cell/size 1 (+ 3 (length categories)) (gnc:make-html-text (gnc:html-markup-hr)))))
+        (gnc:html-table-append-row/markup! table "grand-total"
+          (append
+            (list (gnc:make-html-table-cell/markup "total-label-cell" "Total"))
             (map
-              gnc:make-html-table-cell/markup
-              (append (list "text-cell" "number-cell") (make-list (length categories) "number-cell") (list "number-cell"))
-              (append (list name value) fractions)
+              (lambda (sum)
+                (gnc:make-html-table-cell/markup "total-number-cell" sum)
+              )
+              totals
             )
           )
         )
-      )
-      category-data
-    )
-    (gnc:html-table-append-row/markup! table "grand-total" (list (gnc:make-html-table-cell/size 1 (+ 3 (length categories)) (gnc:make-html-text (gnc:html-markup-hr)))))
-    (gnc:html-table-append-row/markup! table "grand-total"
-      (append
-        (list (gnc:make-html-table-cell/markup "total-label-cell" "Total"))
-        (map
-          (lambda (sum)
-            (gnc:make-html-table-cell/markup "total-number-cell" sum)
-          )
-          totals
-        )
+        (gnc:html-document-add-object! document (gnc:make-html-text "<div class=\"data-table\">"))
+        (gnc:html-document-add-object! document table)
+        (gnc:html-document-add-object! document (gnc:make-html-text "</div>"))
       )
     )
-    (gnc:html-document-add-object! document table)
   )
 )
 
@@ -578,6 +593,11 @@
           )
         )
       )
+      ;; Show tables
+      (add-option (gnc:make-simple-boolean-option gnc:pagename-general optname-show-tables "a" (N_ "Show tables with detailed information.") #t))
+
+    ;; Categories tab
+
       ;; Currencies to group by
       (add-option (gnc:make-string-option pagename-categories optname-category-currencies "c" (N_ "A semicolon-separated list of currencies to group by.") (N_ "EUR;USD;CHF;GBP")))
       ;; Regions to group by
@@ -631,6 +651,7 @@
         (report-currency     (get-option gnc:pagename-general optname-report-currency))
         (report-date         (gnc:time64-end-day-time (gnc:date-option-absolute-time (get-option gnc:pagename-general optname-report-date))))
         (price-source        (get-option gnc:pagename-general optname-price-source))
+        (show-tables         (get-option gnc:pagename-general optname-show-tables))
         (asset-categories    (list "STOCK" "BOND" "DERIVATIVES" "CASH" "COMMODITIES" "REALESTATE"))
         (region-categories   (string-split (get-option pagename-categories optname-category-regions) #\;))
         (currency-categories (string-split (get-option pagename-categories optname-category-currencies) #\;))
@@ -647,15 +668,17 @@
       (gnc:html-document-set-title! document (G_ "Portfolio Allocations"))
 
       (gnc:html-document-add-object!
-       document
-       (gnc:make-html-text         
-        
-        (gnc:html-markup-p
-         (gnc:html-markup/format
-          (G_ "Report date: ~a.") 
-          (gnc:html-markup-b time-string)))
-            ))
+        document
+        (gnc:make-html-text
+          (gnc:html-markup-p (gnc:html-markup/format (G_ "Report date: ~a.") (gnc:html-markup-b time-string)))
+        )
+      )
 
+      (if show-tables
+        (gnc:html-document-add-object! document (gnc:make-html-text "<div class=\"container\" style=\"display: grid; grid-template-columns: 1fr;\">"))
+        (gnc:html-document-add-object! document (gnc:make-html-text "<div class=\"container\" style=\"display: grid; grid-template-columns: 1fr 1fr;\">"))
+      )
+      
       (if (not (null? accounts))
         (begin
           (let* ((stock-accounts          (filter-accounts-by-type accounts (list ACCT-TYPE-STOCK ACCT-TYPE-ASSET)))
@@ -664,18 +687,19 @@
                  (currency-category-data  (analyze-currencies accounts currency-categories report-currency report-date exchange-fn))
                  (region-category-data    (analyze-regions    stock-accounts account-stock-fractions region-categories market-region-map report-currency report-date exchange-fn))
                  (market-category-data    (analyze-markets    stock-accounts account-stock-fractions market-categories report-currency report-date exchange-fn)))
-            (render-category-allocation document (G_ "Asset Types") asset-categories asset-category-data report-currency report-date exchange-fn asset-category-to-name)
-            (render-category-allocation document (G_ "Currencies") currency-categories currency-category-data report-currency report-date exchange-fn identity)
-            (render-category-allocation document (G_ "Regions (Stock)") region-categories region-category-data report-currency report-date exchange-fn region-category-to-name)
-            (render-category-allocation document (G_ "Market Types (Stock)") market-categories market-category-data report-currency report-date exchange-fn market-category-to-name)
+            (render-category-allocation document (G_ "Asset Types") show-tables asset-categories asset-category-data report-currency report-date exchange-fn asset-category-to-name)
+            (render-category-allocation document (G_ "Currencies") show-tables currency-categories currency-category-data report-currency report-date exchange-fn identity)
+            (render-category-allocation document (G_ "Regions (Stock)") show-tables region-categories region-category-data report-currency report-date exchange-fn region-category-to-name)
+            (render-category-allocation document (G_ "Market Types (Stock)") show-tables market-categories market-category-data report-currency report-date exchange-fn market-category-to-name)
           )
         )
         (gnc:html-document-add-object!
           document
-          (gnc:make-html-text
-          (gnc:html-markup-p (G_ "You have selected no accounts.")))
+          (gnc:make-html-text (gnc:html-markup-p (G_ "You have selected no accounts.")))
         )
       )
+      (gnc:html-document-add-object! document (gnc:make-html-text "</div>"))
+
       document
     )
   )
