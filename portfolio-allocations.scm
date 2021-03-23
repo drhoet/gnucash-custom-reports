@@ -262,10 +262,10 @@
   )
 )
 
-(define (calculate-market-distribution acct)
+(define (calculate-generic-distribution acct line-prefix)
   (let* ((tmp-map (make-hash-table 15))
          (notes (xaccAccountGetNotes acct))
-         (fractions (parse-notes-for-fractions notes "#MARKET_TYPE:" ";")))
+         (fractions (parse-notes-for-fractions notes line-prefix ";")))
     (if fractions
       (for-each
         (lambda (row)
@@ -277,6 +277,18 @@
     )
     tmp-map
   )
+)
+
+(define (calculate-market-distribution acct)
+  (calculate-generic-distribution acct "#MARKET_TYPE:")
+)
+
+(define (calculate-size-distribution acct)
+  (calculate-generic-distribution acct "#SIZE_FACTOR:")
+)
+
+(define (calculate-value-distribution acct)
+  (calculate-generic-distribution acct "#VALUE_FACTOR:")
 )
 
 ;; Analyzes a set of accounts in categories
@@ -350,6 +362,14 @@
   )
 )
 
+(define (analyze-size-factor stock-accounts account-stock-fractions size-categories report-currency report-date exchange-fn)
+  (analyze-categories stock-accounts account-stock-fractions size-categories calculate-size-distribution report-currency report-date exchange-fn)
+)
+
+(define (analyze-value-factor stock-accounts account-stock-fractions value-categories report-currency report-date exchange-fn)
+  (analyze-categories stock-accounts account-stock-fractions value-categories calculate-value-distribution report-currency report-date exchange-fn)
+)
+
 (define (asset-category-to-name cat)
   (cond ((string=? "STOCK" cat) (G_ "Stock"))
         ((string=? "BOND" cat) (G_ "Bonds"))
@@ -374,6 +394,23 @@
 (define (market-category-to-name cat)
   (cond ((string=? "DEVELOPED" cat) (G_ "Developed Markets"))
         ((string=? "EMERGING" cat) (G_ "Emerging Markets"))
+        (else (G_ "Unknown Category!!!"))
+  )
+)
+
+(define (value-category-to-name cat)
+  (cond ((string=? "VALUE" cat) (G_ "Value"))
+        ((string=? "GROWTH" cat) (G_ "Growth"))
+        (else (G_ "Unknown Category!!!"))
+  )
+)
+
+(define (size-category-to-name cat)
+  (cond ((string=? "GIANT" cat) (G_ "Giant"))
+        ((string=? "LARGE" cat) (G_ "Large"))
+        ((string=? "MID" cat) (G_ "Mid"))
+        ((string=? "SMALL" cat) (G_ "Small"))
+        ((string=? "MICRO" cat) (G_ "Micro"))
         (else (G_ "Unknown Category!!!"))
   )
 )
@@ -657,6 +694,8 @@
         (currency-categories (string-split (get-option pagename-categories optname-category-currencies) #\;))
         (market-region-map   (parse-market-to-region-map (get-option pagename-categories optname-market-to-region-mapping)))
         (market-categories   (list "DEVELOPED" "EMERGING"))
+        (value-categories    (list "VALUE" "GROWTH"))
+        (size-categories     (list "MICRO" "SMALL" "MID" "LARGE" "GIANT"))
         (document            (gnc:make-html-document)))
 
     ;; these are samples of different date options. for a simple
@@ -683,14 +722,18 @@
         (begin
           (let* ((stock-accounts          (filter-accounts-by-type accounts (list ACCT-TYPE-STOCK ACCT-TYPE-ASSET)))
                  (account-stock-fractions (calculate-stock-fractions stock-accounts))
-                 (asset-category-data     (analyze-assets     accounts asset-categories report-currency report-date exchange-fn))
-                 (currency-category-data  (analyze-currencies accounts currency-categories report-currency report-date exchange-fn))
-                 (region-category-data    (analyze-regions    stock-accounts account-stock-fractions region-categories market-region-map report-currency report-date exchange-fn))
-                 (market-category-data    (analyze-markets    stock-accounts account-stock-fractions market-categories report-currency report-date exchange-fn)))
+                 (asset-category-data     (analyze-assets       accounts asset-categories report-currency report-date exchange-fn))
+                 (currency-category-data  (analyze-currencies   accounts currency-categories report-currency report-date exchange-fn))
+                 (region-category-data    (analyze-regions      stock-accounts account-stock-fractions region-categories market-region-map report-currency report-date exchange-fn))
+                 (market-category-data    (analyze-markets      stock-accounts account-stock-fractions market-categories report-currency report-date exchange-fn))
+                 (value-category-data     (analyze-value-factor stock-accounts account-stock-fractions value-categories report-currency report-date exchange-fn))
+                 (size-category-data      (analyze-size-factor  stock-accounts account-stock-fractions size-categories report-currency report-date exchange-fn)))
             (render-category-allocation document (G_ "Asset Types") show-tables asset-categories asset-category-data report-currency report-date exchange-fn asset-category-to-name)
             (render-category-allocation document (G_ "Currencies") show-tables currency-categories currency-category-data report-currency report-date exchange-fn identity)
             (render-category-allocation document (G_ "Regions (Stock)") show-tables region-categories region-category-data report-currency report-date exchange-fn region-category-to-name)
             (render-category-allocation document (G_ "Market Types (Stock)") show-tables market-categories market-category-data report-currency report-date exchange-fn market-category-to-name)
+            (render-category-allocation document (G_ "Value Factor (Stock)") show-tables value-categories value-category-data report-currency report-date exchange-fn value-category-to-name)
+            (render-category-allocation document (G_ "Size Factor (Stock)") show-tables size-categories size-category-data report-currency report-date exchange-fn size-category-to-name)
           )
         )
         (gnc:html-document-add-object!
